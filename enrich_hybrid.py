@@ -60,7 +60,12 @@ HUNTER_RATE_DELAY = 0.3
 SMTP_TIMEOUT = 10
 DNS_TIMEOUT = 5
 SMTP_CONCURRENCY = 15
-PROBE_FROM = "verify@example.com"
+# SMTP probe identity — use plausible-looking sender + HELO hostname so
+# mail servers don't classify our probe as obvious spam-scanner and return
+# blanket 550 rejections for every address.  Override via env vars if you
+# own a domain with SPF pointing to your IP (best case).
+PROBE_FROM = os.environ.get("SMTP_PROBE_FROM", "postmaster@gmail.com")
+PROBE_HELO = os.environ.get("SMTP_PROBE_HELO", "mail.gmail.com")
 FAKE_LOCAL = "zz_nonexistent_user_9f8e7d6c5b4a3"
 
 # ---------------- helpers ----------------
@@ -281,8 +286,12 @@ class SMTPVerifier:
     def _smtp_probe(self, mx_host: str, email: str) -> tuple[int, str]:
         try:
             with smtplib.SMTP(mx_host, 25, timeout=SMTP_TIMEOUT,
-                              local_hostname="enricher.local") as s:
-                s.ehlo_or_helo_if_needed()
+                              local_hostname=PROBE_HELO) as s:
+                # Force EHLO (modern) then fall back; pass our HELO name so
+                # servers doing reverse DNS / HELO checks don't blanket-reject.
+                code, _ = s.ehlo(PROBE_HELO)
+                if code >= 500:
+                    s.helo(PROBE_HELO)
                 s.mail(PROBE_FROM)
                 code, msg = s.rcpt(email)
                 return code, (msg.decode() if isinstance(msg, bytes)
@@ -310,24 +319,29 @@ class SMTPVerifier:
         self.catchall_cache[domain] = val
         return val
 
-    def verify(self, email: str, mx_host: str) -> str:
-        """Returns 'verified' | 'rejected' | 'catchall' | 'unreachable'."""
+    def verify(self, email: str, mx_host: str) -> tuple[str, str]:
+        """Returns (status, detail). Status is one of:
+           'verified' | 'rejected' | 'catchall' | 'greylisted' | 'unreachable'
+        Detail contains the raw SMTP response for transparency."""
         if self.port25_ok is False:
-            return "unreachable"
+            return "unreachable", "port25_blocked"
         domain = email.split("@", 1)[1]
         catch = self.is_catchall(domain, mx_host)
         if catch is None:
-            return "unreachable"
+            return "unreachable", "catchall_probe_failed"
         if catch:
-            return "catchall"
-        code, _ = self._smtp_probe(mx_host, email)
+            return "catchall", "server_accepts_all"
+        code, msg = self._smtp_probe(mx_host, email)
+        detail = f"{code} {msg[:80]}" if code >= 0 else f"conn_err:{msg[:60]}"
         if code == -1:
-            return "unreachable"
+            return "unreachable", detail
         if 250 <= code < 260:
-            return "verified"
+            return "verified", detail
+        if code in (450, 451, 452):
+            return "greylisted", detail        # retry later; don't trust
         if 500 <= code < 600:
-            return "rejected"
-        return "unreachable"
+            return "rejected", detail
+        return "unreachable", detail
 
 
 # ---------------- main pipeline ----------------
@@ -443,18 +457,33 @@ def _process(args, people: list[dict], cache: dict,
                     and smtp.port25_ok is not False):
                 mx_host = mx_list[0]
                 ck = f"{candidate}|{mx_host}"
-                status = cache["smtp"].get(ck)
-                if status is None:
-                    status = smtp.verify(candidate, mx_host)
-                    cache["smtp"][ck] = status
-                row["source"] = f"pattern+smtp:{status}"
+                cached = cache["smtp"].get(ck)
+                if isinstance(cached, str):
+                    # Legacy cache: old runs stored only the status string.
+                    status, detail = cached, "cached"
+                elif isinstance(cached, list) and len(cached) == 2:
+                    status, detail = cached
+                else:
+                    status, detail = smtp.verify(candidate, mx_host)
+                    cache["smtp"][ck] = [status, detail]
+                row["source"] = f"smtp:{status}|{detail}"
                 if status == "verified":
                     row.update(email=candidate, tier=1, confidence="95")
                     return row
                 if status == "catchall":
                     row.update(email=candidate, tier=3, confidence="60")
                     return row
-                # rejected / unreachable -> continue
+                if status == "greylisted":
+                    # Server deferred; treat like catch-all (unverified but plausible)
+                    row.update(email=candidate, tier=3, confidence="50")
+                    return row
+                if status == "rejected":
+                    # Server said "no such user" — but could be false positive
+                    # if the server is rejecting ALL probes. Mark email but
+                    # drop confidence low and call it out.
+                    row.update(email=candidate, tier=4, confidence="25")
+                    return row
+                # unreachable -> fall through to Hunter fallback
             else:
                 # Skipped SMTP (google/microsoft/none) -> pattern only
                 row.update(email=candidate, tier=3, confidence="55",
@@ -560,6 +589,8 @@ def main() -> None:
                     help="Disable Hunter calls (fully free, pattern-guess only).")
     ap.add_argument("--hunter-budget", type=int, default=None,
                     help="Max number of Hunter API calls this run.")
+    ap.add_argument("--retry-smtp", action="store_true",
+                    help="Invalidate cached SMTP results and re-probe.")
     args = ap.parse_args()
 
     input_path = Path(args.input)
@@ -577,6 +608,10 @@ def main() -> None:
         print("No Hunter key; running free-only mode.")
 
     cache = _load_cache()
+    if args.retry_smtp:
+        n = len(cache.get("smtp", {}))
+        cache["smtp"] = {}
+        print(f"Invalidated {n} cached SMTP results (will re-probe).")
     hunter = HunterClient(None if args.no_hunter else key, args.hunter_budget)
     smtp = SMTPVerifier()
 
@@ -599,14 +634,14 @@ def main() -> None:
     tiers = Counter(r["tier"] for r in rows)
     print("\n=== Enrichment complete ===")
     labels = {
-        1: "SMTP-verified",
-        2: "Hunter domain-search match",
-        3: "Pattern only (unverified)",
-        4: "Hunter email-finder",
+        1: "SMTP-verified       (~95%, safe to send)",
+        2: "Hunter domain match (~90%, safe to send)",
+        3: "Pattern unverified  (~55-70%, risky)",
+        4: "Low confidence      (~25%, probably wrong)",
         5: "No email found",
     }
     for t in sorted(labels):
-        print(f"  Tier {t} ({labels[t]:30s}): {tiers.get(t, 0):4d}")
+        print(f"  Tier {t} ({labels[t]:44s}): {tiers.get(t, 0):4d}")
     print(f"\n  Hunter credits used this run: {hunter.calls}")
     print(f"  Output: {OUTPUT_CSV}")
 

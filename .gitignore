@@ -1,0 +1,12 @@
+.venv/
+.apollo_userdata/
+cookies.json
+captured_request.json
+apollo_data.csv
+apollo_data.raw.json
+apollo_data_enriched.csv
+enrichment_cache.json
+hunter_key.txt
+diagnostic_dump/
+__pycache__/
+*.pyc
